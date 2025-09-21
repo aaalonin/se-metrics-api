@@ -61,13 +61,17 @@ def get_metrics():
             'new_tickets': [],
             'resolved_tickets': [],
             'current_status_tickets': [],
+            'transfer_tickets': [],
             'incident_tickets': [],
-            'labels_count': Counter()
+            'labels_count': Counter(),
+            'se_transfers_resolved': []
         }
 
-        # Calculate current week dates (Monday to Sunday) - EXACTLY LIKE se_weekly_metrics_puller.py
+        # Calculate LAST week dates (Monday to Sunday) - EXACTLY LIKE se_weekly_metrics_puller.py
         today = datetime.now()
-        week_start = today - timedelta(days=today.weekday())
+        # Get this Monday, then subtract 7 days to get last Monday
+        this_monday = today - timedelta(days=today.weekday())
+        week_start = this_monday - timedelta(days=7)
         week_end = week_start + timedelta(days=6)
 
         # Debug: Print the actual dates being used
@@ -110,11 +114,27 @@ def get_metrics():
                 any('incident' in label.lower() for label in labels)):
                 metrics['incident_tickets'].append(ticket_data)
 
-        # FETCH RESOLVED TICKETS THIS WEEK
-        resolved_jql = f'project = SE AND resolved >= "{week_start.strftime("%Y-%m-%d")}" AND resolved <= "{week_end.strftime("%Y-%m-%d")}"'
-        resolved_response = fetch_jira_data(resolved_jql, auth, headers)
+        # FETCH RESOLVED TICKETS THIS WEEK - Using multiple methods
+        resolved_tickets = []
+        all_resolved_keys = set()
 
-        for issue in resolved_response:
+        # Method 1: Tickets with resolved field set this week
+        resolved_jql1 = f'project = SE AND resolved >= "{week_start.strftime("%Y-%m-%d")}" AND resolved <= "{week_end.strftime("%Y-%m-%d")}"'
+
+        # Method 2: Tickets that changed to Done status this week - MOST ACCURATE
+        resolved_jql2 = f'project = SE AND status CHANGED TO "Done" DURING ("{week_start.strftime("%Y-%m-%d")}", "{week_end.strftime("%Y-%m-%d")}")'
+
+        for jql in [resolved_jql1, resolved_jql2]:
+            resolved_response = fetch_jira_data(jql, auth, headers, fields="key,summary,status,created,resolved,updated", expand="changelog")
+
+            for issue in resolved_response:
+                issue_key = issue['key']
+                if issue_key not in all_resolved_keys:
+                    all_resolved_keys.add(issue_key)
+                    resolved_tickets.append(issue)
+
+        # Process unique resolved tickets
+        for issue in resolved_tickets:
             fields = issue.get('fields', {})
 
             # Calculate resolution time
@@ -126,9 +146,21 @@ def get_metrics():
                 try:
                     created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
                     resolved_dt = datetime.fromisoformat(resolved.replace('Z', '+00:00'))
-                    resolution_days = (resolved_dt - created_dt).total_seconds() / 86400
+                    resolution_hours = (resolved_dt - created_dt).total_seconds() / 3600
+                    resolution_days = resolution_hours / 24
                 except:
                     resolution_days = 0
+            elif created:
+                # If no resolved date, look for resolution in changelog
+                resolution_date = find_resolution_date_in_changelog(issue)
+                if resolution_date:
+                    try:
+                        created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                        resolved_dt = datetime.fromisoformat(resolution_date.replace('Z', '+00:00'))
+                        resolution_hours = (resolved_dt - created_dt).total_seconds() / 3600
+                        resolution_days = resolution_hours / 24
+                    except:
+                        resolution_days = 0
 
             ticket_data = {
                 'key': issue['key'],
@@ -169,13 +201,53 @@ def get_metrics():
 
             metrics['current_status_tickets'].append(ticket_data)
 
+        # FETCH TRANSFER TICKETS THIS WEEK
+        teams = ['EIM', 'ENGGMNT', 'AM', 'MRKT']
+
+        for team in teams:
+            # Look for tickets created this week that mention SE
+            transfer_jql = f'project = {team} AND created >= "{week_start.strftime("%Y-%m-%d")}" AND created <= "{week_end.strftime("%Y-%m-%d")}" AND (text ~ "SE-" OR summary ~ "SE-")'
+
+            transfer_response = fetch_jira_data(transfer_jql, auth, headers, fields="key,summary,status,created,updated,description", expand="changelog", max_results=50)
+
+            for issue in transfer_response:
+                fields = issue.get('fields', {})
+                summary = fields.get('summary', '')
+                description = fields.get('description', '') or ''
+
+                # Check if this is really an SE transfer
+                is_se_transfer = False
+                original_se_key = "Unknown"
+
+                if 'SE-' in summary or 'SE-' in str(description):
+                    is_se_transfer = True
+                    # Extract SE key from text
+                    import re
+                    match = re.search(r'SE-\d+', summary + " " + str(description))
+                    if match:
+                        original_se_key = match.group(0)
+
+                if is_se_transfer:
+                    existing_keys = [t['key'] for t in metrics['transfer_tickets']]
+                    if issue['key'] not in existing_keys:
+                        ticket_data = {
+                            'key': issue['key'],
+                            'team': team,
+                            'summary': summary,
+                            'status': fields.get('status', {}).get('name', ''),
+                            'created': fields.get('created', ''),
+                            'original_se_key': original_se_key
+                        }
+                        metrics['transfer_tickets'].append(ticket_data)
+
         # CALCULATE METRICS
         new_count = len(metrics['new_tickets'])
         resolved_count = len(metrics['resolved_tickets'])
         incident_count = len(metrics['incident_tickets'])
+        transfer_count = len(metrics['transfer_tickets'])
 
-        # Average resolution time
-        resolution_times = [t['resolution_days'] for t in metrics['resolved_tickets'] if t['resolution_days'] > 0]
+        # Average resolution time (include all valid resolutions >= 0)
+        resolution_times = [t['resolution_days'] for t in metrics['resolved_tickets'] if t['resolution_days'] >= 0]
         avg_resolution = round(sum(resolution_times) / len(resolution_times), 1) if resolution_times else 0.0
 
         # Resolution speed buckets
@@ -212,6 +284,14 @@ def get_metrics():
         # Top 5 labels
         top_labels = metrics['labels_count'].most_common(5)
 
+        # Team transfer breakdown
+        team_transfers = defaultdict(int)
+        transfer_details = []
+        for ticket in metrics['transfer_tickets']:
+            team_transfers[ticket['team']] += 1
+            if len(transfer_details) < 6:  # Limit for display
+                transfer_details.append(ticket)
+
         # Build response
         return jsonify({
             "success": True,
@@ -223,6 +303,7 @@ def get_metrics():
             "resolvedTicketsCount": resolved_count,
             "averageResolutionDays": avg_resolution,
             "incidentsCount": incident_count,
+            "transfersCount": transfer_count,
 
             # Resolution speed buckets
             "speedBuckets": {
@@ -241,6 +322,13 @@ def get_metrics():
             "statusAnalysis": dict(status_analysis),
             "topLabels": [{'label': label, 'count': count} for label, count in top_labels],
 
+            # Transfer information
+            "transfers": {
+                "total": transfer_count,
+                "byTeam": dict(team_transfers),
+                "details": transfer_details[:5]  # First 5 transfers
+            },
+
             # Generation info
             "generatedAt": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         })
@@ -252,7 +340,23 @@ def get_metrics():
             "execution_method": "Render_Flask_API"
         }), 500
 
-def fetch_jira_data(jql, auth, headers, fields="key,summary,status,created,updated,resolved,labels,priority", max_results=100):
+def find_resolution_date_in_changelog(issue):
+    """Find the actual resolution date from changelog when resolved field is empty"""
+    changelog = issue.get('changelog', {})
+    histories = changelog.get('histories', [])
+
+    # Look for status changes to resolved states
+    for history in histories:
+        items = history.get('items', [])
+        for item in items:
+            if item.get('field') == 'status':
+                to_status = item.get('toString', '')
+                if to_status in ['Done', 'Resolved', 'Closed', 'Deployed/Done', 'Complete']:
+                    return history.get('created', '')
+
+    return None
+
+def fetch_jira_data(jql, auth, headers, fields="key,summary,status,created,updated,resolved,labels,priority", expand=None, max_results=100):
     """Fetch data from JIRA API with pagination - EXACTLY LIKE se_weekly_metrics_puller.py"""
     all_issues = []
     start_at = 0
@@ -264,6 +368,9 @@ def fetch_jira_data(jql, auth, headers, fields="key,summary,status,created,updat
             'maxResults': min(max_results, 100),  # JIRA limit is 100 per request
             'startAt': start_at
         }
+
+        if expand:
+            params['expand'] = expand
 
         response = requests.get(
             f"{JIRA_BASE_URL}/rest/api/3/search/jql",
