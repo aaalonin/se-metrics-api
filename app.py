@@ -31,6 +31,27 @@ def home():
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
+@app.route('/test-dates')
+def test_dates():
+    """Debug endpoint to check date calculations"""
+    today = datetime.now()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+
+    # Test with a known week that should have tickets
+    test_week_start = datetime(2024, 9, 16)  # Monday Sep 16, 2024
+    test_week_end = datetime(2024, 9, 22)    # Sunday Sep 22, 2024
+
+    return jsonify({
+        "current_system_date": today.strftime('%Y-%m-%d'),
+        "calculated_week_start": week_start.strftime('%Y-%m-%d'),
+        "calculated_week_end": week_end.strftime('%Y-%m-%d'),
+        "test_week_start": test_week_start.strftime('%Y-%m-%d'),
+        "test_week_end": test_week_end.strftime('%Y-%m-%d'),
+        "jql_current": f'project = SE AND created >= "{week_start.strftime("%Y-%m-%d")}" AND created <= "{week_end.strftime("%Y-%m-%d")}"',
+        "jql_test": f'project = SE AND created >= "{test_week_start.strftime("%Y-%m-%d")}" AND created <= "{test_week_end.strftime("%Y-%m-%d")}"'
+    })
+
 @app.route('/metrics')
 def get_metrics():
     """Main endpoint that returns SE weekly metrics"""
@@ -44,10 +65,15 @@ def get_metrics():
             'labels_count': Counter()
         }
 
-        # Calculate current week dates
+        # Calculate current week dates (Monday to Sunday) - EXACTLY LIKE se_weekly_metrics_puller.py
         today = datetime.now()
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
+
+        # Debug: Print the actual dates being used
+        print(f"Today's date: {today.strftime('%Y-%m-%d')}")
+        print(f"Week start: {week_start.strftime('%Y-%m-%d')}")
+        print(f"Week end: {week_end.strftime('%Y-%m-%d')}")
 
         print(f"Fetching metrics for: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
 
@@ -226,16 +252,16 @@ def get_metrics():
             "execution_method": "Render_Flask_API"
         }), 500
 
-def fetch_jira_data(jql, auth, headers, max_results=100):
-    """Fetch data from JIRA API with pagination"""
+def fetch_jira_data(jql, auth, headers, fields="key,summary,status,created,updated,resolved,labels,priority", max_results=100):
+    """Fetch data from JIRA API with pagination - EXACTLY LIKE se_weekly_metrics_puller.py"""
     all_issues = []
     start_at = 0
 
     while True:
         params = {
             'jql': jql,
-            'fields': 'key,summary,status,created,updated,resolved,labels,priority',
-            'maxResults': max_results,
+            'fields': fields,
+            'maxResults': min(max_results, 100),  # JIRA limit is 100 per request
             'startAt': start_at
         }
 
