@@ -1,0 +1,267 @@
+from flask import Flask, jsonify
+import requests
+from datetime import datetime, timedelta
+from collections import defaultdict, Counter
+
+app = Flask(__name__)
+
+# JIRA API Configuration - Using environment variables for security
+import os
+
+JIRA_BASE_URL = os.environ.get('JIRA_BASE_URL', 'https://healthjoy.atlassian.net')
+JIRA_EMAIL = os.environ.get('JIRA_EMAIL')
+JIRA_API_TOKEN = os.environ.get('JIRA_API_TOKEN')
+
+# Check if credentials are set
+if not JIRA_EMAIL or not JIRA_API_TOKEN:
+    print("WARNING: JIRA credentials not found in environment variables!")
+    print("Set JIRA_EMAIL and JIRA_API_TOKEN in your deployment platform.")
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "SE Weekly Metrics API is running!",
+        "endpoints": {
+            "/metrics": "Get weekly SE metrics",
+            "/health": "Health check"
+        }
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/metrics')
+def get_metrics():
+    """Main endpoint that returns SE weekly metrics"""
+    try:
+        # Initialize metrics storage
+        metrics = {
+            'new_tickets': [],
+            'resolved_tickets': [],
+            'current_status_tickets': [],
+            'incident_tickets': [],
+            'labels_count': Counter()
+        }
+
+        # Calculate current week dates
+        today = datetime.now()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        print(f"Fetching metrics for: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+
+        # Setup authentication
+        auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+        headers = {'Accept': 'application/json'}
+
+        # FETCH NEW TICKETS THIS WEEK
+        new_tickets_jql = f'project = SE AND created >= "{week_start.strftime("%Y-%m-%d")}" AND created <= "{week_end.strftime("%Y-%m-%d")}"'
+        new_tickets_response = fetch_jira_data(new_tickets_jql, auth, headers)
+
+        for issue in new_tickets_response:
+            fields = issue.get('fields', {})
+            labels = fields.get('labels', [])
+
+            # Count labels
+            for label in labels:
+                if label.lower() != 'support':
+                    metrics['labels_count'][label] += 1
+
+            ticket_data = {
+                'key': issue['key'],
+                'summary': fields.get('summary', ''),
+                'status': fields.get('status', {}).get('name', ''),
+                'created': fields.get('created', ''),
+                'labels': labels,
+                'priority': fields.get('priority', {}).get('name', '') if fields.get('priority') else ''
+            }
+
+            metrics['new_tickets'].append(ticket_data)
+
+            # Check for incidents
+            if (ticket_data['priority'] in ['Highest', 'Critical'] or
+                any('incident' in label.lower() for label in labels)):
+                metrics['incident_tickets'].append(ticket_data)
+
+        # FETCH RESOLVED TICKETS THIS WEEK
+        resolved_jql = f'project = SE AND resolved >= "{week_start.strftime("%Y-%m-%d")}" AND resolved <= "{week_end.strftime("%Y-%m-%d")}"'
+        resolved_response = fetch_jira_data(resolved_jql, auth, headers)
+
+        for issue in resolved_response:
+            fields = issue.get('fields', {})
+
+            # Calculate resolution time
+            created = fields.get('created', '')
+            resolved = fields.get('resolved', '')
+            resolution_days = 0
+
+            if created and resolved:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    resolved_dt = datetime.fromisoformat(resolved.replace('Z', '+00:00'))
+                    resolution_days = (resolved_dt - created_dt).total_seconds() / 86400
+                except:
+                    resolution_days = 0
+
+            ticket_data = {
+                'key': issue['key'],
+                'summary': fields.get('summary', ''),
+                'status': fields.get('status', {}).get('name', ''),
+                'created': created,
+                'resolved': resolved,
+                'resolution_days': resolution_days
+            }
+
+            metrics['resolved_tickets'].append(ticket_data)
+
+        # FETCH ACTIVE TICKETS FOR STATUS ANALYSIS
+        active_jql = f'project = SE AND updated >= "{week_start.strftime("%Y-%m-%d")}" AND updated <= "{week_end.strftime("%Y-%m-%d")}" AND status NOT IN ("Done", "Closed", "Resolved")'
+        active_response = fetch_jira_data(active_jql, auth, headers)
+
+        for issue in active_response:
+            fields = issue.get('fields', {})
+
+            # Calculate days in current status
+            updated = fields.get('updated', '')
+            days_in_status = 0
+
+            if updated:
+                try:
+                    updated_dt = datetime.fromisoformat(updated.replace('Z', '+00:00'))
+                    days_in_status = (datetime.now() - updated_dt.replace(tzinfo=None)).days
+                except:
+                    days_in_status = 0
+
+            ticket_data = {
+                'key': issue['key'],
+                'summary': fields.get('summary', ''),
+                'status': fields.get('status', {}).get('name', ''),
+                'updated': updated,
+                'days_in_status': days_in_status
+            }
+
+            metrics['current_status_tickets'].append(ticket_data)
+
+        # CALCULATE METRICS
+        new_count = len(metrics['new_tickets'])
+        resolved_count = len(metrics['resolved_tickets'])
+        incident_count = len(metrics['incident_tickets'])
+
+        # Average resolution time
+        resolution_times = [t['resolution_days'] for t in metrics['resolved_tickets'] if t['resolution_days'] > 0]
+        avg_resolution = round(sum(resolution_times) / len(resolution_times), 1) if resolution_times else 0.0
+
+        # Resolution speed buckets
+        resolution_buckets = {
+            'under_24h': 0,
+            '1_3_days': 0,
+            '3_7_days': 0,
+            'over_7_days': 0
+        }
+
+        for days in resolution_times:
+            if days < 1.0:
+                resolution_buckets['under_24h'] += 1
+            elif days <= 3.0:
+                resolution_buckets['1_3_days'] += 1
+            elif days <= 7.0:
+                resolution_buckets['3_7_days'] += 1
+            else:
+                resolution_buckets['over_7_days'] += 1
+
+        # Status analysis
+        status_analysis = defaultdict(lambda: {'count': 0, 'total_days': 0})
+        for ticket in metrics['current_status_tickets']:
+            status = ticket['status']
+            days = ticket['days_in_status']
+            status_analysis[status]['count'] += 1
+            status_analysis[status]['total_days'] += days
+
+        # Calculate averages for status
+        for status, data in status_analysis.items():
+            if data['count'] > 0:
+                data['avg_days'] = round(data['total_days'] / data['count'], 1)
+
+        # Top 5 labels
+        top_labels = metrics['labels_count'].most_common(5)
+
+        # Build response
+        return jsonify({
+            "success": True,
+            "execution_method": "Render_Flask_API",
+            "data_source": "Real_JIRA_API",
+
+            # Main metrics
+            "newTicketsCount": new_count,
+            "resolvedTicketsCount": resolved_count,
+            "averageResolutionDays": avg_resolution,
+            "incidentsCount": incident_count,
+
+            # Resolution speed buckets
+            "speedBuckets": {
+                "lessThan24h": resolution_buckets['under_24h'],
+                "oneToThreeDays": resolution_buckets['1_3_days'],
+                "threeToSevenDays": resolution_buckets['3_7_days'],
+                "moreThanSevenDays": resolution_buckets['over_7_days']
+            },
+
+            # Week info
+            "weekStart": week_start.strftime('%B %d'),
+            "weekEnd": week_end.strftime('%B %d, %Y'),
+            "weekRange": f"{week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}",
+
+            # Status analysis
+            "statusAnalysis": dict(status_analysis),
+            "topLabels": [{'label': label, 'count': count} for label, count in top_labels],
+
+            # Generation info
+            "generatedAt": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "execution_method": "Render_Flask_API"
+        }), 500
+
+def fetch_jira_data(jql, auth, headers, max_results=100):
+    """Fetch data from JIRA API with pagination"""
+    all_issues = []
+    start_at = 0
+
+    while True:
+        params = {
+            'jql': jql,
+            'fields': 'key,summary,status,created,updated,resolved,labels,priority',
+            'maxResults': max_results,
+            'startAt': start_at
+        }
+
+        response = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+            auth=auth,
+            headers=headers,
+            params=params
+        )
+
+        if response.status_code != 200:
+            print(f"Error fetching JIRA data: {response.status_code}")
+            break
+
+        data = response.json()
+        issues = data.get('issues', [])
+        all_issues.extend(issues)
+
+        total = data.get('total', 0)
+
+        if len(issues) < max_results or start_at + max_results >= total:
+            break
+
+        start_at += max_results
+
+    return all_issues
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
